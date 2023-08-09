@@ -15,27 +15,65 @@ CHARSET = string.ascii_lowercase + string.digits
 def generate_node_id():
 	return ''.join(random.choice(CHARSET) for _ in range(16))
 
+class GraphNamespace:
+	def __init__(self, name: str, parent = None):
+		self.name = name
+		self.parent = parent
+		self.children = []
+
+		if self.parent is not None:
+			self.parent.children.append(self)
+
+	def __repr__(self):
+		s = []
+		cur = self
+
+		while cur is not None:
+			s.append(cur.name)
+			cur = cur.parent
+		
+		return ".".join(s[::-1])
+	
+	def __str__(self):
+		return self.name
+	
+	def traverse_down(self):
+		""" returns a list of all children namespaces"""
+		s = [self]
+		for child in self.children:
+			s.extend(child.traverse_down())
+		return s
+
+	def traverse(self):
+		""" returns a list of all connected namespaces """
+		root = self
+		while root.parent is not None:
+			root = root.parent
+		
+		return root.traverse_down()
+
 class GraphNode:
 	def __repr__(self) -> str:
 		typename = list(NODE_TYPES.keys())[self.type]
-		primary_group = "" if len(self.group_names) == 0 else " " + self.group_names[0]
+		name = "" if self.name is None else f" {self.namespace.name + '.' if self.namespace is not None else ''}" + self.name
 		data = str(self.data)
 		if len(data) > 40:
 			data = f"{data[0:40]}..."
 
-		return f"{self.id}: {typename}{primary_group} ({data}) -> {self.output_shape}"
+		return f"{self.id}: {typename}{name} ({data}) -> {self.output_shape}"
 
 	def __str__(self) -> str:
 		return repr(self)
 
-	def __init__(self, group_names = [], n_type = 0, data = {}, prev = [], output_shape = (1, 1), bandwidth_out = 16, capacity = 16, compute_units = 1) -> None:
+	def __init__(self, name = None, n_type = 0, data = {}, prev = [], output_shape = (1, 1), bandwidth_out = 16, capacity = 16, compute_units = 1, namespace = None) -> None:
 		self.type = n_type
 		self.prev = prev
-		self.group_names = group_names
+		self.name = name
 		self.id = generate_node_id()
 		self.bandwidth = bandwidth_out
 		self.capacity = capacity
 		self.compute_units = compute_units
+		self.namespace = namespace
 
 		self.data = data
 		self.output_shape = output_shape
@@ -149,25 +187,20 @@ class GraphNode:
 			return self.output_shape[0] * self.output_shape[1]
 		
 		return 0
-	
-	def apply_namespace(self, namespace: str):
-		"""	Applies a namespace to this node and all of its children """
-		for i in range(len(self.group_names)):
-			if not self.group_names[i].startswith(namespace):
-				self.group_names[i] = f"{namespace}_{self.group_names[i]}"
-		
-		for node in self.prev:
-			node.apply_namespace(namespace)
 
 
 class CompGraph:
 	def __init__(self, end: GraphNode):
 		self.starts = []
+		self.topo = []
 		self.end = end
-		self.nodes = {}
 		self.next = {end.id: []}
+		self.nodes = {}
+		self.nodes_by_name = {}
 		self.node_costs = {}
 		self.node_groups = {}
+		self.namespace_nodes = {}
+		self.namespaces = {}
 		self.total_cost = -1
 
 		visited_set = set()
@@ -184,11 +217,26 @@ class CompGraph:
 			if len(node.prev) == 0:
 				self.starts.append(node)
 
-			if len(node.group_names) > 0:
-				for group_name in node.group_names:
-					if group_name not in self.node_groups:
-						self.node_groups[group_name] = []
-					self.node_groups[group_name].append(node)
+			if node.name is not None:
+				if node.name not in self.nodes_by_name:
+					self.nodes_by_name[node.name] = []
+				self.nodes_by_name[node.name].append(node)
+
+			if node.namespace is not None:
+				qualified = repr(node.namespace)
+				registered = qualified in self.namespaces
+				self.namespaces[qualified] = node.namespace
+				
+				if not registered:
+					connected = node.namespace.traverse()
+
+					for ns in connected:
+						qual_conn = repr(ns)
+						self.namespaces[qual_conn] = ns
+				
+				if qualified not in self.namespace_nodes:
+					self.namespace_nodes[qualified] = []
+				self.namespace_nodes[qualified].append(node)
 			
 			while node.id in self.nodes:
 				node.id = generate_node_id()
@@ -204,6 +252,7 @@ class CompGraph:
 				queue.append(prev)
 
 		validation_queue = self.toposort()
+		self.topo = validation_queue
 
 		error_list = []
 		for node in validation_queue:
@@ -241,19 +290,31 @@ class CompGraph:
 		self.total_cost = total_cost
 		return total_cost
 	
-	def groups(self) -> List[str]:
-		return list(self.node_groups.keys())
+	def direct_namespace_cost(self, namespace: GraphNamespace) -> int:
+		""" returns the cost of a namespace """
+		if repr(namespace) not in self.namespace_nodes:
+			return 0
+		
+		return sum([self.node_costs[node.id] for node in self.namespace_nodes[repr(namespace)]])
 	
-	def compute_group_cost(self, group_name: str) -> int:
-		cost = 0
-		for node in self.node_groups[group_name]:
-			n_cost = node.cost()
-			self.node_costs[node.id] = n_cost
-			cost += n_cost
-	      
-		return cost
+	def namespace_cost(self, namespace: GraphNamespace) -> int:
+		""" returns the cost of a namespace and all its children """
+		if repr(namespace) not in self.namespaces:
+			return 0
+		
+		return self.direct_namespace_cost(namespace) + sum([self.namespace_cost(ns) for ns in namespace.children])
+	
+	def get_namespaces(self) -> List[str]:
+		return list(self.namespaces.keys())
+	
+	def find_namespaces(self, query) -> List[GraphNamespace]:
+		""" returns namespaces matching query """
+		names = list(filter(lambda ns: query in repr(ns), self.namespaces.keys()))
+		return [self.namespaces[name] for name in names]
 
-	def compute_dependency(self):
+
+	def generate_depgraph(self):
+		""" generates a simplified representation of the graph, realising data dependencies and compute clusters. """
 		pass
 
 	def compute_latency(self) -> int:
@@ -268,56 +329,68 @@ def import_graph(self, filename) -> CompGraph:
 	""" import graph from a yaml file"""
 	pass
 
-def bert_encoder(first = True) -> GraphNode:
+def joined(predecessor: CompGraph, successor: CompGraph, pivot: GraphNode) -> CompGraph:
+	""" joins two graphs together at a pivot node """
+	pass
+
+def bert_encoder(first = True, namespace = None) -> (GraphNode, GraphNode):
 	""" returns a GraphNode hierarchy representing one encoder in the BERT model """
 	dim = 1024
 	hidden_dim = 4096
 	len = 512
 	heads = 16
 	dh = dim//heads
+
+	ffn_namespace = GraphNamespace("ffn", namespace)
+	ffn_unit_namespaces = [GraphNamespace(f"FFN{i+1}", ffn_namespace) for i in range(len)]
+
+	attention_namespace = GraphNamespace("self-attention", namespace)
+	attention_head_namespaces = [GraphNamespace(f"head-{i+1}", attention_namespace) for i in range(heads)]
+	KQV_namespaces = [GraphNamespace(f"{'QKV'[i%3]}{i//3+1}", attention_head_namespaces[i//3]) for i in range(heads * 3)]
 	
-	end = GraphNode(n_type = NODE_TYPES["SCALE"], group_names = ["Output"], prev = [GraphNode(n_type = NODE_TYPES["COMBINE"], data = {"axis": "row"}, group_names = ["Output"])])
-	pre_FFN = GraphNode(n_type = NODE_TYPES["SPLIT"], data = {"axis": "row", "ways": len}, prev = [])
-	
+
+	end = GraphNode(n_type = NODE_TYPES["SCALE"], name = "Encoder Output (Residual Add)", namespace = namespace,prev = [GraphNode(n_type = NODE_TYPES["COMBINE"], data = {"axis": "row"}, name = "Post FFN Combine")])
+	pre_FFN = GraphNode(n_type = NODE_TYPES["SPLIT"], name = "Pre FFN Split", namespace = namespace, data = {"axis": "row", "ways": len}, prev = [])
+
 	FFNs = [
-		GraphNode(n_type = NODE_TYPES["MATMUL"], group_names = [f"FFN{i + 1} Output Layer", f"FFN{i + 1}", "FFN"], prev = [
-			GraphNode(n_type = NODE_TYPES["MATMUL"], group_names = [f"FFN{i + 1} Hidden Layer", f"FFN{i + 1}", "FFN"], prev = [
+		GraphNode(n_type = NODE_TYPES["MATMUL"], name = "Output Layer", namespace = ffn_unit_namespaces[i], prev = [
+			GraphNode(n_type = NODE_TYPES["MATMUL"], name = "Hidden Layer", namespace = ffn_unit_namespaces[i], prev = [
 				pre_FFN,
-				GraphNode(n_type = NODE_TYPES["DATA"], group_names = [f"FFN{i + 1} Hidden Weights", f"FFN{i + 1}", "FFN"], output_shape = (dim, hidden_dim))
+				GraphNode(n_type = NODE_TYPES["DATA"], name = "Hidden Weights", namespace = ffn_unit_namespaces[i], output_shape = (dim, hidden_dim))
 			]),
-			GraphNode(n_type = NODE_TYPES["DATA"], group_names = [f"FFN{i + 1} Output Weights", f"FFN{i + 1}", "FFN"], output_shape = (hidden_dim, dim))
+			GraphNode(n_type = NODE_TYPES["DATA"], name = "Output Weights", namespace = ffn_unit_namespaces[i], output_shape = (hidden_dim, dim))
 		])
 	for i in range(len)]
 
 	end.prev[0].prev = FFNs
 
-	pre_heads = GraphNode(n_type = NODE_TYPES["DATA" if first else "PASSTHROUGH"], output_shape = (len, dim), group_names = ["Input Sequence", "Input"])
+	pre_heads = GraphNode(n_type = NODE_TYPES["DATA" if first else "PASSTHROUGH"], namespace = namespace, output_shape = (len, dim), name = "Input Sequence")
 	
 	attention_heads = [
-		GraphNode(n_type = NODE_TYPES["MATMUL"], group_names = [f"Attention Head {i + 1} Output Layer", f"Attention Head {i + 1}"], prev = [
-			GraphNode(n_type = NODE_TYPES["SCALE"], group_names= [f"Attention Head {i + 1} Softmax(*)+Scale", f"Attention Head {i + 1}"], prev = [
-				GraphNode(n_type = NODE_TYPES["MATMUL"], group_names = [f"Attention Head {i + 1} KQ", f"Attention Head {i + 1}"], prev = [
-					GraphNode(n_type = NODE_TYPES["MATMUL"], group_names = [f"Attention Head {i + 1} Q", f"Attention Head {i + 1}"], prev = [
+		GraphNode(n_type = NODE_TYPES["MATMUL"], name = "Output Layer", namespace = attention_head_namespaces[i], prev = [
+			GraphNode(n_type = NODE_TYPES["SCALE"], name = "Softmax(*) + Scale", namespace = attention_head_namespaces[i], prev = [
+				GraphNode(n_type = NODE_TYPES["MATMUL"], name = "KtQ", namespace = attention_head_namespaces[i], prev = [
+					GraphNode(n_type = NODE_TYPES["MATMUL"], name = "Generator", namespace = KQV_namespaces[i * 3], prev = [
 						pre_heads,
-						GraphNode(n_type = NODE_TYPES["DATA"], group_names = [f"Attention Head {i + 1} Q Weights", f"Attention Head {i + 1}"], output_shape = (dim, dh))
+						GraphNode(n_type = NODE_TYPES["DATA"], name = "Weights", namespace = KQV_namespaces[i * 3], output_shape = (dim, dh))
 					]),
-					GraphNode(n_type = NODE_TYPES["MATMUL"], group_names = [f"Attention Head {i + 1} K", f"Attention Head {i + 1}"], prev = [
+					GraphNode(n_type = NODE_TYPES["MATMUL"], name = "Generator", namespace = KQV_namespaces[i * 3 + 1], prev = [
 						pre_heads,
-						GraphNode(n_type = NODE_TYPES["DATA"], group_names = [f"Attention Head {i + 1} K Weights", f"Attention Head {i + 1}"], output_shape = (dim, dh))
+						GraphNode(n_type = NODE_TYPES["DATA"], name = "Weights", namespace = KQV_namespaces[i * 3 + 1], output_shape = (dim, dh))
 					])
 				], data = {"transpose_b": True})
 			]),
-			GraphNode(n_type = NODE_TYPES["MATMUL"], group_names = [f"Attention Head {i + 1} V", f"Attention Head {i + 1}"], prev = [
+			GraphNode(n_type = NODE_TYPES["MATMUL"], name = "Generator", namespace = KQV_namespaces[i * 3 + 2], prev = [
 				pre_heads,
-				GraphNode(n_type = NODE_TYPES["DATA"], group_names = [f"Attention Head {i + 1} V Weights", f"Attention Head {i + 1}"], output_shape = (dim, dh))
+				GraphNode(n_type = NODE_TYPES["DATA"], name = "Weights", namespace = KQV_namespaces[i * 3 + 2], output_shape = (dim, dh))
 			]),
 		])
 	for i in range(heads)]
 
 	pre_FFN.prev = [
-		GraphNode(n_type = NODE_TYPES["MATMUL"], group_names = ["Self-Attention"], prev = [
-			GraphNode(n_type = NODE_TYPES["COMBINE"], group_names = ["Self-Attention"], data = {"axis": "col"}, prev = attention_heads),
-			GraphNode(n_type = NODE_TYPES["DATA"], group_names = ["Self-Attention Output Weights", "Self-Attention"], output_shape = (dim, dim))
+		GraphNode(n_type = NODE_TYPES["MATMUL"], name = "Output", namespace = attention_namespace, prev = [
+			GraphNode(n_type = NODE_TYPES["COMBINE"], name = "Join Heads", namespace = attention_namespace, data = {"axis": "col"}, prev = attention_heads),
+			GraphNode(n_type = NODE_TYPES["DATA"], name = "Output Weights", namespace = attention_namespace, output_shape = (dim, dim))
 		])
 	]
 
@@ -331,8 +404,8 @@ if __name__ == "__main__":
 	end = None
 	cur = None
 	for i in range(encoders, 0, -1):
-		(encoder_start, encoder_end) = bert_encoder(i == 1)
-		encoder_end.apply_namespace(f"Encoder {i}")
+		namespace = GraphNamespace(f"Encoder {i}", None)
+		(encoder_start, encoder_end) = bert_encoder(i == 1, namespace)
 		if cur is not None:
 			cur.prev = [encoder_end]
 		else:
@@ -341,4 +414,19 @@ if __name__ == "__main__":
 		cur = encoder_start
 
 	graph = CompGraph(end)
-	graph.compute_costs()
+	print(f"Total Costs (MAC): {graph.compute_costs()}")
+	a = graph.find_namespaces("FFN512")[0]
+	b = a.parent
+	c = graph.namespaces["Encoder 24"]
+	d = graph.namespaces["Encoder 24.self-attention.head-1"]
+	e = graph.namespaces["Encoder 24.self-attention"]
+
+	print(f"Costs (MAC) of a single FFN {repr(a)}: {graph.namespace_cost(a)}")
+	print(f"Costs (MAC) of all FFN in an encoder {repr(b)}: {graph.namespace_cost(b)}")
+	print(f"Direct Costs (MAC) of all FFN in an encoder {repr(b)}: {graph.direct_namespace_cost(b)}")
+	print(f"Costs (MAC) of an encoder {repr(c)}: {graph.namespace_cost(c)}")
+	print(f"Direct Costs (MAC) of an encoder {repr(c)}: {graph.direct_namespace_cost(c)}")
+	print(f"Costs (MAC) of a single attention head {repr(d)}: {graph.namespace_cost(d)}")
+	print(f"Direct Costs (MAC) of a single attention head {repr(d)}: {graph.direct_namespace_cost(d)}")
+	print(f"Costs (MAC) of all attention heads in an encoder {repr(e)}: {graph.namespace_cost(e)}")
+	print(f"Direct Costs (MAC) of all attention heads in an encoder {repr(e)}: {graph.direct_namespace_cost(e)}")
