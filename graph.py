@@ -1,5 +1,7 @@
 import string, random
 from typing import List
+from functools import cache
+from math import prod
 
 NODE_TYPES = {
     "MATMUL": 0,
@@ -24,6 +26,7 @@ class GraphNamespace:
 		if self.parent is not None:
 			self.parent.children.append(self)
 
+	@cache
 	def __repr__(self):
 		s = []
 		cur = self
@@ -37,13 +40,15 @@ class GraphNamespace:
 	def __str__(self):
 		return self.name
 	
+	@cache
 	def traverse_down(self):
-		""" returns a list of all children namespaces"""
+		""" returns a list of all children namespaces including self """
 		s = [self]
 		for child in self.children:
 			s.extend(child.traverse_down())
 		return s
 
+	@cache
 	def traverse(self):
 		""" returns a list of all connected namespaces """
 		root = self
@@ -190,7 +195,10 @@ class GraphNode:
 
 
 class CompGraph:
+	#TODO: add support for extracting namespaces as subgraphs
+
 	def __init__(self, end: GraphNode):
+		# TODO: move work into a compile-ish method for recomputing on changes?
 		self.starts = []
 		self.topo = []
 		self.end = end
@@ -289,7 +297,7 @@ class CompGraph:
 		total_cost = sum(self.node_costs.values())
 		self.total_cost = total_cost
 		return total_cost
-	
+
 	def direct_namespace_cost(self, namespace: GraphNamespace) -> int:
 		""" returns the cost of a namespace """
 		if repr(namespace) not in self.namespace_nodes:
@@ -305,9 +313,62 @@ class CompGraph:
 		return self.direct_namespace_cost(namespace) + sum([self.namespace_cost(ns) for ns in namespace.children])
 	
 	def get_namespaces(self) -> List[str]:
-		return list(self.namespaces.keys())
+		return [repr(ns) for ns in self.namespaces.keys()]
 	
-	def find_namespaces(self, query) -> List[GraphNamespace]:
+	def get_all_nodes_in(self, namespace):
+		""" returns all nodes in a namespace and its children """
+		if repr(namespace) not in self.namespaces:
+			return []
+		
+		tree = namespace.traverse_down()
+		nodes = set()
+		for node in tree:
+			r = repr(node)
+			if r in self.namespace_nodes:
+				nodes.update(self.namespace_nodes[r])
+
+		return list(nodes)
+	
+	def namespace_data(self, namespace: GraphNamespace) -> dict:
+		""" returns information about the data flow quantities in the namespace in words """
+		if repr(namespace) not in self.namespaces:
+			return {"data-in": 0, "data-resident": 0, "data-out": 0, "in_nodes": set(), "out_nodes": set(), "resident": set()}
+		
+		tree = namespace.traverse_down()
+		nodes = self.get_all_nodes_in(namespace)
+		
+		data_in = data_out = data_resident = 0
+
+		in_nodes = set()
+		out_nodes = set()
+		resident = set()
+
+		for node in nodes:
+			if node.type == NODE_TYPES["DATA"]:
+				data_resident += node.output_shape[0] * node.output_shape[1]
+				resident.add(node)
+			else:
+				out = any([n.namespace not in tree for n in self.next[node.id]])
+
+				if out:
+					out_nodes.add(node)
+
+				inp = filter(lambda n: n.namespace not in tree, node.prev)
+				in_nodes.update(inp)
+
+
+		for o in out_nodes:
+			data_out += prod(o.output_shape)
+
+		for i in in_nodes:
+			if i.type == NODE_TYPES["SPLIT"]:
+				data_in += prod(i.output_shape) * i.data["ways"]
+			else:
+				data_in += prod(i.output_shape)
+
+		return {"data-in": data_in, "data-resident": data_resident, "data-out": data_out, "in_nodes": in_nodes, "out_nodes": out_nodes, "resident": resident}
+
+	def find_namespaces(self, query: str) -> List[GraphNamespace]:
 		""" returns namespaces matching query """
 		names = list(filter(lambda ns: query in repr(ns), self.namespaces.keys()))
 		return [self.namespaces[name] for name in names]
@@ -315,10 +376,6 @@ class CompGraph:
 
 	def generate_depgraph(self):
 		""" generates a simplified representation of the graph, realising data dependencies and compute clusters. """
-		pass
-
-	def compute_latency(self) -> int:
-		""" returns the latency of the graph in terms of the number of cycles required to execute the graph """
 		pass
 
 	def export_graph(self, filename):
@@ -334,6 +391,7 @@ def joined(predecessor: CompGraph, successor: CompGraph, pivot: GraphNode) -> Co
 	pass
 
 def bert_encoder(first = True, namespace = None) -> (GraphNode, GraphNode):
+	# TODO: write parser from torch model to generalise
 	""" returns a GraphNode hierarchy representing one encoder in the BERT model """
 	dim = 1024
 	hidden_dim = 4096
@@ -346,19 +404,21 @@ def bert_encoder(first = True, namespace = None) -> (GraphNode, GraphNode):
 
 	attention_namespace = GraphNamespace("self-attention", namespace)
 	attention_head_namespaces = [GraphNamespace(f"head-{i+1}", attention_namespace) for i in range(heads)]
-	KQV_namespaces = [GraphNamespace(f"{'QKV'[i%3]}{i//3+1}", attention_head_namespaces[i//3]) for i in range(heads * 3)]
+	KQV_namespaces = [GraphNamespace(f"{'QKV'[i%3]}", attention_head_namespaces[i//3]) for i in range(heads * 3)]
 	
 
 	end = GraphNode(n_type = NODE_TYPES["SCALE"], name = "Encoder Output (Residual Add)", namespace = namespace,prev = [GraphNode(n_type = NODE_TYPES["COMBINE"], data = {"axis": "row"}, name = "Post FFN Combine")])
 	pre_FFN = GraphNode(n_type = NODE_TYPES["SPLIT"], name = "Pre FFN Split", namespace = namespace, data = {"axis": "row", "ways": len}, prev = [])
+	FFN_wh = GraphNode(n_type = NODE_TYPES["DATA"], name = "Hidden Weights", namespace = ffn_namespace, output_shape = (dim, hidden_dim))
+	FFN_wo = GraphNode(n_type = NODE_TYPES["DATA"], name = "Output Weights", namespace = ffn_namespace, output_shape = (hidden_dim, dim))
 
 	FFNs = [
 		GraphNode(n_type = NODE_TYPES["MATMUL"], name = "Output Layer", namespace = ffn_unit_namespaces[i], prev = [
 			GraphNode(n_type = NODE_TYPES["MATMUL"], name = "Hidden Layer", namespace = ffn_unit_namespaces[i], prev = [
 				pre_FFN,
-				GraphNode(n_type = NODE_TYPES["DATA"], name = "Hidden Weights", namespace = ffn_unit_namespaces[i], output_shape = (dim, hidden_dim))
+				FFN_wh
 			]),
-			GraphNode(n_type = NODE_TYPES["DATA"], name = "Output Weights", namespace = ffn_unit_namespaces[i], output_shape = (hidden_dim, dim))
+			FFN_wo
 		])
 	for i in range(len)]
 
